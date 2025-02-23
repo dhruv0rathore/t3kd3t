@@ -12,10 +12,20 @@ type AuthProvider = 'github' | 'gitlab' | 'email';
 
 type Project = {
   id: string;
+  user_id: string;
   name: string;
+  full_name?: string;
+  description?: string;
   status: 'pending' | 'analyzing' | 'completed' | 'failed';
-  created_at: string;
   provider: AuthProvider;
+  git_url?: string;
+  html_url?: string;
+  default_branch?: string;
+  created_at: string;
+  updated_at: string;
+  error_message?: string | null;
+  analysis_results?: any | null;
+  analyzed_at?: string | null;
 };
 
 type GithubRepo = {
@@ -23,6 +33,20 @@ type GithubRepo = {
   name: string;
   full_name: string;
   description: string | null;
+};
+
+type PostgrestError = {
+  message: string;
+  details: string;
+  hint: string;
+  code: string;
+};
+
+type PostgrestResponse<T> = {
+  data: T | null;
+  error: PostgrestError | null;
+  status: number;
+  statusText: string;
 };
 
 export default function Dashboard() {
@@ -37,6 +61,7 @@ export default function Dashboard() {
   const [githubRepos, setGithubRepos] = useState<GithubRepo[]>([]);
   const [selectedRepo, setSelectedRepo] = useState<GithubRepo | null>(null);
   const [showRepoList, setShowRepoList] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
 
   useEffect(() => {
     async function initializeDashboard() {
@@ -76,73 +101,377 @@ export default function Dashboard() {
   const fetchGithubRepos = async () => {
     try {
       const { data: { session } } = await supabase.auth.getSession();
-      if (!session?.provider_token) throw new Error('No provider token');
+      if (!session?.provider_token) {
+        // Re-authenticate to get fresh token with proper scopes
+        const { error } = await supabase.auth.signInWithOAuth({
+          provider: 'github',
+          options: {
+            redirectTo: `${process.env.NEXT_PUBLIC_SITE_URL}/dashboard`,
+            scopes: 'repo read:user'
+          }
+        });
+        if (error) throw error;
+        return;
+      }
 
-      const response = await fetch('https://api.github.com/user/repos', {
+      const response = await fetch('https://api.github.com/user/repos?per_page=100&sort=updated', {
         headers: {
-          Authorization: `Bearer ${session.provider_token}`,
+          'Authorization': `Bearer ${session.provider_token}`,
+          'Accept': 'application/vnd.github.v3+json'
         },
       });
-      const repos = await response.json();
-      if (!response.ok) throw new Error(repos.message);
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.message || 'Failed to fetch repositories');
+      }
       
+      const repos = await response.json();
       setGithubRepos(repos);
       setShowRepoList(true);
     } catch (error: any) {
       toast({
         title: "Error",
-        description: error.message,
+        description: error.message || "Failed to fetch repositories",
         variant: "destructive",
       });
+      // If token is invalid, trigger re-authentication
+      if (error.message?.includes('401')) {
+        await supabase.auth.signInWithOAuth({
+          provider: 'github',
+          options: {
+            redirectTo: `${process.env.NEXT_PUBLIC_SITE_URL}/dashboard`,
+            scopes: 'repo read:user'
+          }
+        });
+      }
     }
   };
 
-  const handleRepositoryImport = async () => {
-    if (!selectedRepo) {
-      await fetchGithubRepos();
-      return;
-    }
+  const handleRepositoryImport = async (repoUrl: string) => {
+    setIsAnalyzing(true);
+    let projectId: string | null = null;
 
-    setImportLoading(true);
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) throw new Error('Not authenticated');
+      console.log('Starting repository import with URL:', repoUrl);
 
-      const { data: project, error } = await supabase
-        .from('projects')
-        .insert([
-          {
-            user_id: session.user.id,
-            name: selectedRepo.name,
-            full_name: selectedRepo.full_name,
-            description: selectedRepo.description,
-            status: 'pending',
-            provider: authProvider,
+      // Validate repository URL
+      if (!repoUrl.startsWith('https://github.com/')) {
+        throw new Error('Invalid repository URL. Please provide a valid GitHub repository URL.');
+      }
+
+      // Check if user is authenticated
+      const { data: { session } } = await supabase.auth.getSession();
+      console.log('Auth session:', session ? 'Found' : 'Not found');
+      
+      if (!session) {
+        toast({
+          title: "Authentication Required",
+          description: "Please sign in to analyze repositories",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      // Get GitHub token from session
+      const githubToken = session.provider_token;
+      console.log('GitHub token:', githubToken ? 'Present' : 'Missing');
+      
+      if (!githubToken) {
+        toast({
+          title: "GitHub Token Missing",
+          description: "Please reconnect your GitHub account",
+          variant: "destructive"
+        });
+        
+        // Trigger GitHub re-authentication
+        await supabase.auth.signInWithOAuth({
+          provider: 'github',
+          options: {
+            redirectTo: `${window.location.origin}/dashboard`,
+            scopes: 'repo read:user'
           }
-        ])
+        });
+        return;
+      }
+
+      // Extract repository name from URL
+      const repoName = repoUrl.split('/').pop()?.replace('.git', '') || '';
+      console.log('Repository name:', repoName);
+
+      // Create project in database with minimal required fields
+      console.log('Creating project with data:', {
+        name: repoName,
+        git_url: repoUrl,
+        user_id: session.user.id,
+        provider: 'github',
+        status: 'analyzing'
+      });
+
+      // First, verify the user's session and role
+      const {
+        data: { user },
+        error: userError
+      } = await supabase.auth.getUser();
+
+      if (userError) {
+        console.error('Error getting user:', userError);
+        throw new Error('Failed to verify user authentication');
+      }
+
+      if (!user) {
+        throw new Error('No authenticated user found');
+      }
+
+      // Try to create the project with error debugging
+      const createResult: PostgrestResponse<Project> = await supabase
+        .from('projects')
+        .insert({
+          name: repoName,
+          git_url: repoUrl,
+          user_id: user.id,
+          provider: 'github',
+          status: 'analyzing'
+        })
         .select()
         .single();
 
-      if (error) throw error;
+      // Log the entire response first
+      console.log('Raw Supabase Response:', createResult);
 
-      if (project) {
-        setProjects(prev => [project, ...prev]);
-        setSelectedRepo(null);
-        setShowRepoList(false);
+      // Handle errors with proper type checking
+      if (createResult.error) {
+        let errorMessage = 'Failed to create project';
+        let errorCode = null;
+        
+        // Safely access error properties
+        if (typeof createResult.error === 'object' && createResult.error !== null) {
+          const error = createResult.error as PostgrestError;
+          errorMessage = error.message || errorMessage;
+          errorCode = error.code;
+          
+          // Log the error details safely
+          console.error('Project creation failed:', error?.message || 'Unknown error', {
+            message: errorMessage || 'No message available',
+            code: errorCode || 'No code available',
+            status: createResult?.status || 'unknown'
+          });
+
+          // Handle specific error codes
+          if (errorCode === '42501' || createResult.status === 401) {
+            throw new Error('Authentication error. Please sign in again.');
+          } else if (errorCode === '42P01') {
+            throw new Error('Database table not found. Please contact support.');
+          } else if (errorCode === '23505') {
+            throw new Error('A project with this name already exists.');
+          } else if (errorCode === '23503') {
+            throw new Error('Invalid user ID or missing required fields.');
+          }
+        } else {
+          console.error('Unexpected error format:', createResult.error);
+        }
+
+        throw new Error(errorMessage);
       }
 
-      toast({
-        title: "Repository Connected",
-        description: "Your repository has been connected and is queued for analysis.",
+      if (!createResult.data) {
+        console.error('No data returned from project creation');
+        throw new Error('Project creation failed: No data returned');
+      }
+
+      const project = createResult.data;
+      projectId = project.id;
+      console.log('Successfully created project:', project);
+
+      // Start analysis with all required parameters
+      console.log('Starting analysis with data:', {
+        projectId: project.id,
+        repoUrl,
+        provider: 'github'
       });
-    } catch (error: any) {
+
+      const response = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${githubToken}`
+        },
+        body: JSON.stringify({
+          projectId: project.id,
+          repoUrl,
+          provider: 'github',
+          accessToken: githubToken
+        })
+      });
+
+      let responseData;
+      try {
+        responseData = await response.json();
+      } catch (e) {
+        responseData = { error: 'Failed to parse response' };
+      }
+
+      if (!response.ok) {
+        console.error('Analysis API error:', {
+          status: response.status,
+          statusText: response.statusText,
+          error: responseData?.error || 'Unknown error',
+          details: responseData?.details
+        });
+        
+        // Update project status to failed
+        await supabase
+          .from('projects')
+          .update({
+            status: 'failed',
+            error_message: responseData?.error || 'Analysis failed to start'
+          })
+          .eq('id', project.id);
+        
+        if (response.status === 401) {
+          toast({
+            title: "Authentication Failed",
+            description: "GitHub authentication failed. Please reconnect your GitHub account",
+            variant: "destructive"
+          });
+          // Trigger GitHub re-authentication
+          await supabase.auth.signInWithOAuth({
+            provider: 'github',
+            options: {
+              redirectTo: `${window.location.origin}/dashboard`,
+              scopes: 'repo read:user'
+            }
+          });
+        } else if (response.status === 404) {
+          toast({
+            title: "Repository Not Found",
+            description: "Please check the repository URL",
+            variant: "destructive"
+          });
+        } else if (responseData.error) {
+          toast({
+            title: "Analysis Failed",
+            description: responseData.error,
+            variant: "destructive"
+          });
+        } else {
+          toast({
+            title: "Analysis Error",
+            description: "Failed to start analysis. Please try again",
+            variant: "destructive"
+          });
+        }
+        
+        throw new Error(`Analysis failed: ${responseData.error || response.statusText}`);
+      }
+
+      console.log('Analysis API response:', responseData);
+
+      // Poll for analysis completion with better error handling
+      const maxAttempts = 30; // 5 minutes with 10-second intervals
+      let attempts = 0;
+      
+      while (attempts < maxAttempts) {
+        console.log(`Polling attempt ${attempts + 1}/${maxAttempts} for project ${project.id}`);
+        
+        const { data: updatedProject, error: fetchError } = await supabase
+          .from('projects')
+          .select('*')
+          .eq('id', project.id)
+          .single();
+
+        if (fetchError) {
+          console.error('Error fetching project status:', fetchError);
+          continue;
+        }
+
+        console.log('Project status update:', {
+          id: updatedProject?.id,
+          status: updatedProject?.status,
+          analyzed_at: updatedProject?.analyzed_at,
+          error_message: updatedProject?.error_message
+        });
+
+        if (!updatedProject) {
+          throw new Error('Project not found during status check');
+        }
+
+        if (updatedProject.status === 'completed') {
+          toast({
+            title: "Analysis Complete",
+            description: "Repository analysis completed successfully!",
+            variant: "default"
+          });
+          router.refresh();
+          break;
+        } else if (updatedProject.status === 'failed') {
+          toast({
+            title: "Analysis Failed",
+            description: updatedProject.error_message || 'Unknown error occurred during analysis',
+            variant: "destructive"
+          });
+          break;
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds
+        attempts++;
+      }
+
+      if (attempts >= maxAttempts) {
+        throw new Error('Analysis timed out');
+      }
+
+    } catch (error: unknown) {
+      // First log the raw error for debugging
+      console.log('Raw error caught:', error);
+
+      // Create a structured error object
+      const errorInfo = {
+        message: error instanceof Error ? error.message : 'Unknown error occurred',
+        type: error instanceof Error ? error.constructor.name : typeof error,
+        stack: error instanceof Error ? error.stack : undefined,
+        details: error instanceof Object ? error : undefined
+      };
+
+      // Log the structured error
+      console.error('Repository import failed:', errorInfo?.message || 'Unknown error', {
+        ...(errorInfo || {}),
+        timestamp: new Date().toISOString()
+      });
+      
+      // Update project status if we have a project ID
+      if (projectId) {
+        try {
+          const { error: updateError } = await supabase
+            .from('projects')
+            .update({
+              status: 'failed',
+              error_message: errorInfo.message
+            })
+            .eq('id', projectId);
+
+          if (updateError) {
+            console.error('Failed to update project status:', {
+              error: updateError,
+              projectId
+            });
+          }
+        } catch (updateError) {
+          console.error('Error updating project status:', {
+            error: updateError instanceof Error ? updateError.message : updateError,
+            projectId
+          });
+        }
+      }
+
+      // Show error toast to user
       toast({
-        title: "Error",
-        description: error.message,
-        variant: "destructive",
+        title: "Analysis Error",
+        description: errorInfo.message,
+        variant: "destructive"
       });
     } finally {
-      setImportLoading(false);
+      setIsAnalyzing(false);
     }
   };
 
@@ -230,7 +559,13 @@ export default function Dashboard() {
                 <div className="relative">
                   <Button 
                     className="bg-gradient-to-r from-[#00FF94] to-[#00B3FF] text-black hover:opacity-90 w-full"
-                    onClick={handleRepositoryImport}
+                    onClick={() => {
+                      if (selectedRepo) {
+                        handleRepositoryImport(`https://github.com/${selectedRepo.full_name}.git`);
+                      } else {
+                        fetchGithubRepos();
+                      }
+                    }}
                     disabled={importLoading}
                   >
                     {importLoading ? (
